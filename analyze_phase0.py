@@ -272,6 +272,7 @@ for label in ["resistive", "hall"]:
     # the flux history. Comparing the SIGN and rough MAGNITUDE of the two
     # measures over the flagged window is therefore a real physics check,
     # not just another arbitrary threshold.
+    nclusters = data["nclusters1"] if "nclusters1" in data.files else None
     if glitch_times and has_ez:
         for t0, t1, d in glitch_times:
             in_window = (t_use >= t0) & (t_use <= t1)
@@ -288,9 +289,21 @@ for label in ["resistive", "hall"]:
                        if same_sign and ratio < 5.0 else
                        "still looks like a tracker artifact (measures "
                        "disagree in sign or by a large factor)")
+            extra = ""
+            if nclusters is not None:
+                # a few snapshots of margin on each side, so a cluster
+                # split that happens right at (rather than strictly inside)
+                # the flagged window still shows up
+                pad = max(1, int(0.8 / max(t_use[1] - t_use[0], 1e-9)))
+                i0 = max(0, int(np.searchsorted(t_use, t0)) - pad)
+                i1 = min(len(t_use), int(np.searchsorted(t_use, t1)) + pad + 1)
+                nc_here = nclusters[i0:i1]
+                extra = (f"; saddle-cluster count in that span: "
+                         f"{list(nc_here)} (>1 = a second candidate X-point "
+                         f"was present, i.e. a real bifurcation)")
             print(f"[{label}] glitch window t=[{t0:.2f},{t1:.2f}]: "
                   f"mean R(flux)={mean_flux_rate:+.4f}, "
-                  f"mean R(direct)={mean_direct_rate:+.4f} -> {verdict}")
+                  f"mean R(direct)={mean_direct_rate:+.4f} -> {verdict}{extra}")
 
     all_curves[label] = (t_use, R_flux, R_direct, glitch_times)
 

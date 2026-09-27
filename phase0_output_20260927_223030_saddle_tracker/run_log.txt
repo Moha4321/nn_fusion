@@ -1,0 +1,9 @@
+script: /Users/mohanarangandesigan/Documents/nn_fusion/gem_hall_mhd_phase0.py
+run_stamp: 20260927_223030  tag: 'saddle_tracker'
+Nx,Ny = 128,128; Lx,Ly = 25.6,25.6
+eta=0.005, nu=0.001, NU4=0.001, di_hall=1.0, cs2=0.5, psi0=0.3, T_FINAL=80.0
+safety_base=0.3, safety_hall=0.15, safety_hyper=0.8, K4_max=243523
+resistive: healthy=True, stop_reason='reached t_final', t_stopped=80.003, steps=8883
+hall: healthy=True, stop_reason='reached t_final', t_stopped=80.000, steps=65003
+resistive max|Bz| at stop: 0.0
+hall max|Bz| at stop: 0.07661349273419167

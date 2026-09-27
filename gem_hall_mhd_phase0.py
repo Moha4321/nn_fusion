@@ -114,6 +114,21 @@ def parse_args():
     p.add_argument("--energy-factor", type=float, default=5.0)
     p.add_argument("--tag", type=str, default="",
                    help="suffix appended to the output directory name")
+    p.add_argument("--continuity-frac", type=float, default=2.0,
+                   help="X-line tracker: strength of the penalty against "
+                        "relabeling onto a spatially distant (but still "
+                        "topologically valid) saddle point, expressed as a "
+                        "multiple of the frame's own |B_perp|^2 spread. "
+                        "Raise this (try 10-20) if the tracker still hops "
+                        "onto a newly-formed secondary X-line during a "
+                        "plasmoid/secondary-tearing burst; 0 disables it.")
+    p.add_argument("--xline-halfwidth", type=int, default=0,
+                   help="X-line tracker search-window half-width in grid "
+                        "cells. 0 (default) uses max(4, nx//8). Shrinking "
+                        "this makes it harder for a newly-born secondary "
+                        "X-point to enter the window and compete with the "
+                        "one already being followed, at the cost of being "
+                        "less tolerant of fast genuine X-line drift.")
     return p.parse_args()
 
 
@@ -412,6 +427,11 @@ def run(label, di, eta, nu, t_final, n_diag,
     t_hist, az1_hist, az2_hist, emag_hist, ekin_hist, jzpeak_hist = [], [], [], [], [], []
     az1_xline_hist, az2_xline_hist = [], []  # X-line-tracking version, see below
     xpos1_hist, xpos2_hist = [], []  # where the tracked X-line actually is, in x
+    nclusters1_hist, nclusters2_hist = [], []  # per-snapshot count of
+    # spatially distinct saddle-point clusters in-window (see
+    # multi_saddle_count comment below) -- saved so it can be checked
+    # directly against glitch timestamps in analyze_phase0.py, not just
+    # reported as a single run-wide total.
     # Direct reconnection-rate diagnostic: the out-of-plane electric field
     # Ez evaluated AT the tracked X-line, from the same generalized Ohm's
     # law used in the induction equation. By Faraday's law this Ez *is*
@@ -433,18 +453,20 @@ def run(label, di, eta, nu, t_final, n_diag,
     fallback_count = {1: 0, 2: 0}  # how often no saddle point was found in
     # the search window and the tracker had to fall back to the old
     # max-|Jz| heuristic -- see the null-point tracking comment below
-    multi_saddle_count = {1: 0, 2: 0}  # CAVEAT, found after the first patch:
-    # this counts grid CELLS satisfying D<0 in-window, not distinct
-    # topological X-points. D<0 holds on a whole extended neighborhood
-    # around any single saddle (it's a continuous field, not a delta
-    # function), so this will read ~200/200 even with exactly one X-line
-    # present -- it is NOT, by itself, evidence of a plasmoid chain. Kept
-    # here (relabeled below) only as a coarse sanity print; a real
-    # plasmoid-chain census would need connected-component labeling of the
-    # saddle mask, which this prototype does not attempt.
-    XLINE_SEARCH_HALFWIDTH = max(4, Nx // 8)  # grid cells; generous enough
-    # for smooth X-line drift between snapshots, tight enough to reject a
-    # jump to an unrelated feature elsewhere in the domain
+    multi_saddle_count = {1: 0, 2: 0}  # SECOND VERSION of this counter.
+    # v1 (counted any grid cell with D<0 in-window) was uninformative --
+    # D<0 holds on a whole extended neighborhood around any single saddle,
+    # so it read ~200/200 even with exactly one X-line present. This
+    # version instead counts CONTIGUOUS x-columns that contain a saddle
+    # cell as one cluster (candidates are ordered by x-offset from the
+    # tracker's last position, so a run of consecutive True columns is one
+    # spatially-connected null region, and a gap of False columns between
+    # two True runs means two topologically distinct candidate X-points).
+    # This is a real, if coarse, per-snapshot plasmoid/X-point census.
+    XLINE_SEARCH_HALFWIDTH = ARGS.xline_halfwidth if ARGS.xline_halfwidth > 0 else max(4, Nx // 8)
+    # grid cells; generous enough for smooth X-line drift between
+    # snapshots, tight enough to reject a jump to an unrelated feature
+    # elsewhere in the domain. Override with --xline-halfwidth.
     # CONTINUITY_FRAC: second-stage fix, still needed even with the saddle
     # (D<0) filter above. That filter rejects O-points/plasmoid centers,
     # but does nothing to stop the tracker jumping between two DIFFERENT
@@ -463,7 +485,7 @@ def run(label, di, eta, nu, t_final, n_diag,
     # position unless a competitor is a much cleaner (much smaller
     # |B_perp|^2) null. Set to 0 to recover the previous (unpenalized)
     # behavior for comparison.
-    CONTINUITY_FRAC = 2.0
+    CONTINUITY_FRAC = ARGS.continuity_frac
     healthy = True
     stop_reason = "reached t_final"
     t0_wall = time.time()
@@ -544,9 +566,9 @@ def run(label, di, eta, nu, t_final, n_diag,
 
             y_band = 2.0 * lam
             iy_band = max(1, int(y_band / dy))
-            for sheet_id, y_sheet, xpos_hist, az_xline_hist, ez_xline_hist in [
-                (1, y1, xpos1_hist, az1_xline_hist, ez_xline1_hist),
-                (2, y2, xpos2_hist, az2_xline_hist, ez_xline2_hist),
+            for sheet_id, y_sheet, xpos_hist, az_xline_hist, ez_xline_hist, nclusters_hist in [
+                (1, y1, xpos1_hist, az1_xline_hist, ez_xline1_hist, nclusters1_hist),
+                (2, y2, xpos2_hist, az2_xline_hist, ez_xline2_hist, nclusters2_hist),
             ]:
                 iy_sheet = int((y_sheet + Ly / 2) / dy)
                 iy_lo = max(0, iy_sheet - iy_band)
@@ -564,8 +586,16 @@ def run(label, di, eta, nu, t_final, n_diag,
                 Bperp2_band = Bperp2_field[ix_candidates][:, iy_lo:iy_hi]
                 saddle_mask = D_band < 0.0
 
-                if int(jnp.sum(saddle_mask)) > 1:
+                saddle_any_ix = np.array(jnp.any(saddle_mask, axis=1))
+                n_clusters = 0
+                was_true = False
+                for is_saddle_here in saddle_any_ix:
+                    if is_saddle_here and not was_true:
+                        n_clusters += 1
+                    was_true = bool(is_saddle_here)
+                if n_clusters > 1:
                     multi_saddle_count[sheet_id] += 1
+                nclusters_hist.append(n_clusters)
 
                 if bool(jnp.any(saddle_mask)):
                     scored = jnp.where(saddle_mask, Bperp2_band, jnp.inf)
@@ -707,12 +737,18 @@ def run(label, di, eta, nu, t_final, n_diag,
                   f"still looks glitchy")
         if n_diag_taken > 0:
             print(f"[{label}] sheet {sheet_id}: {multi_saddle_count[sheet_id]}"
-                  f"/{n_diag_taken} snapshots had >1 grid cell satisfying "
-                  f"D<0 in-window (expected near any single X-line -- see "
-                  f"code comment; NOT a plasmoid-chain count on its own). "
-                  f"The continuity penalty (CONTINUITY_FRAC={CONTINUITY_FRAC}) "
-                  f"still guards against relabeling onto a genuinely "
-                  f"different saddle when one does exist.")
+                  f"/{n_diag_taken} snapshots had MORE THAN ONE spatially "
+                  f"distinct saddle-point cluster in-window -- a genuine "
+                  f"(if coarse) plasmoid/secondary-X-point census this "
+                  f"time. If this count rises sharply right around a "
+                  f"flagged glitch timestamp, that's direct evidence the "
+                  f"glitch is the tracker being handed off to a newly-born "
+                  f"secondary X-line during a bifurcation, not just noise. "
+                  f"Current tracker settings: CONTINUITY_FRAC="
+                  f"{CONTINUITY_FRAC}, XLINE_SEARCH_HALFWIDTH="
+                  f"{XLINE_SEARCH_HALFWIDTH} cells ({XLINE_SEARCH_HALFWIDTH*dx:.2f} "
+                  f"length units) -- override with --continuity-frac / "
+                  f"--xline-halfwidth.")
 
     rho, vx, vy, vz, Bx, By, Bz = state
     return {
@@ -724,6 +760,8 @@ def run(label, di, eta, nu, t_final, n_diag,
         "ez2_xline": np.array(ez_xline2_hist),
         "xpos1": np.array(xpos1_hist),
         "xpos2": np.array(xpos2_hist),
+        "nclusters1": np.array(nclusters1_hist),
+        "nclusters2": np.array(nclusters2_hist),
         "az2": np.array(az2_hist),
         "emag": np.array(emag_hist),
         "ekin": np.array(ekin_hist),
@@ -758,6 +796,7 @@ if __name__ == "__main__":
             az1_xline=data["az1_xline"], az2_xline=data["az2_xline"],
             ez1_xline=data["ez1_xline"], ez2_xline=data["ez2_xline"],
             xpos1=data["xpos1"], xpos2=data["xpos2"],
+            nclusters1=data["nclusters1"], nclusters2=data["nclusters2"],
         )
 
     plt.figure(figsize=(7, 5))
