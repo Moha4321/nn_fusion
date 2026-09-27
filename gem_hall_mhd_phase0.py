@@ -433,9 +433,33 @@ def run(label, di, eta, nu, t_final, n_diag,
     fallback_count = {1: 0, 2: 0}  # how often no saddle point was found in
     # the search window and the tracker had to fall back to the old
     # max-|Jz| heuristic -- see the null-point tracking comment below
+    multi_saddle_count = {1: 0, 2: 0}  # how often MORE THAN ONE saddle point
+    # was present in-window simultaneously -- a direct, quantitative census
+    # of how often a plasmoid chain (multiple simultaneous X-lines) was
+    # actually present in the search band, independent of whether the
+    # continuity penalty below successfully kept the label on the same one
     XLINE_SEARCH_HALFWIDTH = max(4, Nx // 8)  # grid cells; generous enough
     # for smooth X-line drift between snapshots, tight enough to reject a
     # jump to an unrelated feature elsewhere in the domain
+    # CONTINUITY_FRAC: second-stage fix, still needed even with the saddle
+    # (D<0) filter above. That filter rejects O-points/plasmoid centers,
+    # but does nothing to stop the tracker jumping between two DIFFERENT
+    # X-points that are BOTH genuine saddles and BOTH inside the search
+    # window at once -- exactly what a plasmoid CHAIN produces (an
+    # alternating X-O-X-O-X sequence has multiple simultaneous saddles).
+    # Picking the global min-|B_perp|^2 saddle each frame with no memory
+    # of where the tracker just was lets it relabel "the" X-line onto a
+    # neighboring one from one diagnostic snapshot to the next -- a smaller
+    # discontinuity than jumping to an O-point, but still unphysical for a
+    # continuously-tracked flux, and still enough to trip the >8x-median
+    # glitch detector in analyze_phase0.py right at the burst. Fix: add a
+    # soft continuity penalty, scaled to the local spread of |B_perp|^2
+    # among this frame's saddle candidates so it doesn't need hand-tuning
+    # per run, that favors the saddle nearest the tracker's own last
+    # position unless a competitor is a much cleaner (much smaller
+    # |B_perp|^2) null. Set to 0 to recover the previous (unpenalized)
+    # behavior for comparison.
+    CONTINUITY_FRAC = 2.0
     healthy = True
     stop_reason = "reached t_final"
     t0_wall = time.time()
@@ -530,8 +554,30 @@ def run(label, di, eta, nu, t_final, n_diag,
                 Bperp2_band = Bperp2_field[ix_candidates][:, iy_lo:iy_hi]
                 saddle_mask = D_band < 0.0
 
+                if int(jnp.sum(saddle_mask)) > 1:
+                    multi_saddle_count[sheet_id] += 1
+
                 if bool(jnp.any(saddle_mask)):
                     scored = jnp.where(saddle_mask, Bperp2_band, jnp.inf)
+                    if prev_ix[sheet_id] is not None and CONTINUITY_FRAC > 0.0:
+                        # Distance (in x, periodic) from the tracker's own
+                        # last confirmed position, in physical units so it
+                        # combines sensibly with |B_perp|^2's units once
+                        # scaled below.
+                        offsets = jnp.arange(-XLINE_SEARCH_HALFWIDTH,
+                                              XLINE_SEARCH_HALFWIDTH + 1)
+                        dist2 = (offsets.astype(jnp.float64) * dx) ** 2
+                        dist2 = dist2[:, None] * jnp.ones_like(scored)
+                        # Self-calibrating scale: penalize a full-window
+                        # hop by roughly CONTINUITY_FRAC times the spread
+                        # of |B_perp|^2 actually seen among this frame's
+                        # saddle candidates, rather than a fixed constant
+                        # that would need re-tuning for every psi0/eta/t_final.
+                        cand_vals = scored[jnp.isfinite(scored)]
+                        b_scale = float(jnp.std(cand_vals)) + 1e-12
+                        max_d2 = (XLINE_SEARCH_HALFWIDTH * dx) ** 2
+                        penalty = CONTINUITY_FRAC * b_scale / max_d2 * dist2
+                        scored = scored + penalty
                     flat_idx = int(jnp.argmin(scored))
                 else:
                     # no saddle in the window this snapshot -- fall back,
@@ -590,6 +636,16 @@ def run(label, di, eta, nu, t_final, n_diag,
                   f"{fallback_count[sheet_id]}/{n_diag_taken} diagnostic "
                   f"snapshots -- inspect those timestamps if the flux curve "
                   f"still looks glitchy")
+        if n_diag_taken > 0 and multi_saddle_count[sheet_id] > 0:
+            print(f"[{label}] sheet {sheet_id}: more than one genuine saddle "
+                  f"point (candidate X-line) coexisted in the search window "
+                  f"on {multi_saddle_count[sheet_id]}/{n_diag_taken} "
+                  f"snapshots -- a direct census of plasmoid-chain activity. "
+                  f"The continuity penalty (CONTINUITY_FRAC={CONTINUITY_FRAC}) "
+                  f"is what keeps the tracker on one of them instead of "
+                  f"relabeling frame to frame; if analyze_phase0.py still "
+                  f"flags glitches at the same timestamps, increase "
+                  f"CONTINUITY_FRAC before concluding the physics is at fault.")
 
     rho, vx, vy, vz, Bx, By, Bz = state
     return {
