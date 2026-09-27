@@ -217,7 +217,18 @@ for label in ["resistive", "hall"]:
     R_direct = None
     if has_ez:
         ez_xline = data["ez1_xline"]
-        R_direct_curve = ez_xline / (VA_UP * B0)
+        # SIGN FIX: the solver's flux function is defined by Bx=dAz/dy,
+        # By=-dAz/dx (see reconstruct_Az / the Jz=-lap(Az) identity it
+        # enforces), and Faraday's law dB/dt=-curl(E) with that convention
+        # gives d(Az)/dt = -Ez, not +Ez -- derivable directly from the
+        # solver's own induction-equation lines dBxdt=-ddy(Ez),
+        # dBydt=ddx(Ez). The previous version of this script used +Ez,
+        # which silently flipped the sign of every "direct" rate relative
+        # to the (unambiguous, differencing-based) flux rate -- this is why
+        # the two independent measures kept disagreeing by >400% even after
+        # the tracker's position itself was fixed: they were often
+        # comparing a positive number to a negative one.
+        R_direct_curve = -ez_xline / (VA_UP * B0)
         if np.any(late_mask):
             i_local = int(np.argmax(np.abs(R_direct_curve[late_mask])))
             peak_R_direct = R_direct_curve[late_mask][i_local]
@@ -248,6 +259,38 @@ for label in ["resistive", "hall"]:
         print(f"[{label}] no ez1_xline saved (older solver) -- only the "
               f"finite-differenced rate above is available; rerun with the "
               f"patched solver for the direct, less noisy measurement.")
+
+    # --- Is a flagged "glitch" window actually a real fast-reconnection
+    # burst rather than a tracker artifact? A genuine burst is EXPECTED to
+    # have steps many times the surrounding median (that's what "fast"
+    # means), so the >8x-median-step rule alone cannot tell the two apart.
+    # A tracker relabeling artifact and real fast reconnection make
+    # different, checkable predictions: a relabeling jump changes WHERE the
+    # sample is taken but not the true local dPsi/dt, so it should NOT show
+    # up correspondingly in the direct (non-differenced) Ez measurement;
+    # real fast reconnection should, since Ez is measured independently of
+    # the flux history. Comparing the SIGN and rough MAGNITUDE of the two
+    # measures over the flagged window is therefore a real physics check,
+    # not just another arbitrary threshold.
+    if glitch_times and has_ez:
+        for t0, t1, d in glitch_times:
+            in_window = (t_use >= t0) & (t_use <= t1)
+            if not np.any(in_window):
+                continue
+            mean_flux_rate = float(np.mean(R_flux[in_window]))
+            mean_direct_rate = float(np.mean(R_direct[in_window]))
+            same_sign = np.sign(mean_flux_rate) == np.sign(mean_direct_rate)
+            ratio = (abs(mean_flux_rate) / abs(mean_direct_rate)
+                     if abs(mean_direct_rate) > 1e-8 else float("inf"))
+            verdict = ("plausibly REAL fast reconnection (both measures "
+                       "agree in sign, same order of magnitude) -- do not "
+                       "just discard this window without looking at it"
+                       if same_sign and ratio < 5.0 else
+                       "still looks like a tracker artifact (measures "
+                       "disagree in sign or by a large factor)")
+            print(f"[{label}] glitch window t=[{t0:.2f},{t1:.2f}]: "
+                  f"mean R(flux)={mean_flux_rate:+.4f}, "
+                  f"mean R(direct)={mean_direct_rate:+.4f} -> {verdict}")
 
     all_curves[label] = (t_use, R_flux, R_direct, glitch_times)
 

@@ -433,11 +433,15 @@ def run(label, di, eta, nu, t_final, n_diag,
     fallback_count = {1: 0, 2: 0}  # how often no saddle point was found in
     # the search window and the tracker had to fall back to the old
     # max-|Jz| heuristic -- see the null-point tracking comment below
-    multi_saddle_count = {1: 0, 2: 0}  # how often MORE THAN ONE saddle point
-    # was present in-window simultaneously -- a direct, quantitative census
-    # of how often a plasmoid chain (multiple simultaneous X-lines) was
-    # actually present in the search band, independent of whether the
-    # continuity penalty below successfully kept the label on the same one
+    multi_saddle_count = {1: 0, 2: 0}  # CAVEAT, found after the first patch:
+    # this counts grid CELLS satisfying D<0 in-window, not distinct
+    # topological X-points. D<0 holds on a whole extended neighborhood
+    # around any single saddle (it's a continuous field, not a delta
+    # function), so this will read ~200/200 even with exactly one X-line
+    # present -- it is NOT, by itself, evidence of a plasmoid chain. Kept
+    # here (relabeled below) only as a coarse sanity print; a real
+    # plasmoid-chain census would need connected-component labeling of the
+    # saddle mask, which this prototype does not attempt.
     XLINE_SEARCH_HALFWIDTH = max(4, Nx // 8)  # grid cells; generous enough
     # for smooth X-line drift between snapshots, tight enough to reject a
     # jump to an unrelated feature elsewhere in the domain
@@ -531,6 +535,12 @@ def run(label, di, eta, nu, t_final, n_diag,
             vxB_z_now = vx * By - vy * Bx
             JxB_z_now = Jx_now * By - Jy_now * Bx
             Ez_field = -vxB_z_now + eta * Jz_now + (di / rho) * JxB_z_now
+            # Gradients of Ez, needed below for the sub-grid null refinement:
+            # a first-order Taylor step off the nearest GRID point onto the
+            # actual sub-grid location where (Bx,By)=(0,0), so Ez is sampled
+            # at the true null rather than at whichever pixel happened to be
+            # closest to it (see comment at the refinement step below).
+            Ez_dx_field, Ez_dy_field = ddx(Ez_field), ddy(Ez_field)
 
             y_band = 2.0 * lam
             iy_band = max(1, int(y_band / dy))
@@ -593,8 +603,67 @@ def run(label, di, eta, nu, t_final, n_diag,
 
                 prev_ix[sheet_id] = ix_x
                 xpos_hist.append(float(x[ix_x]))
-                az_xline_hist.append(float(Az[ix_x, iy_x]))
-                ez_xline_hist.append(float(Ez_field[ix_x, iy_x]))
+
+                # --- Sub-grid null refinement (one Newton/Taylor step) ---
+                # The chosen (ix_x, iy_x) is the nearest GRID POINT to the
+                # X-line, not the X-line itself: (Bx,By) generically is NOT
+                # exactly (0,0) there, it's just the local minimum of
+                # |B_perp|^2 on the grid. That residual matters a lot for
+                # the DIRECT Ez diagnostic: at the true null the ideal term
+                # -(v x B)_z vanishes identically (both v x B and the Hall
+                # term J x B are proportional to Bx or By), leaving
+                # Ez(null) = eta*Jz(null) alone -- the standard 2D
+                # reconnection-rate relation. Off-null by even one grid
+                # spacing, that residual ideal-MHD term does NOT vanish and,
+                # at small eta, can be larger than the true resistive
+                # signal, corrupting the "direct" rate estimate even though
+                # the TRACKED POSITION itself (used for the flux/gamma
+                # diagnostics) is perfectly fine.
+                #
+                # Fix: take one Newton step using the local Jacobian of
+                # (Bx,By) -- already computed above as dBxdx_now etc. and
+                # D_field = det(Jacobian) -- to solve for the sub-grid
+                # offset (dx_off, dy_off) that zeroes (Bx,By) to linear
+                # order, then Taylor-expand Az and Ez to that same offset
+                # using their own local gradients (dAz/dx=-By, dAz/dy=Bx by
+                # the flux-function definition used throughout this file).
+                # This is the 2D analogue of standard sub-grid null-finding
+                # methods used to locate reconnection X-lines to sub-grid
+                # accuracy (cf. Parnell et al. 1996 for 3D null
+                # classification; Fu et al. 2015, the "first-order Taylor
+                # expansion" X-line method applied to spacecraft data).
+                Bx0 = float(Bx[ix_x, iy_x])
+                By0 = float(By[ix_x, iy_x])
+                a11 = float(dBxdx_now[ix_x, iy_x]); a12 = float(dBxdy_now[ix_x, iy_x])
+                a21 = float(dBydx_now[ix_x, iy_x]); a22 = float(dBydy_now[ix_x, iy_x])
+                D0 = a11 * a22 - a12 * a21  # == D_field[ix_x, iy_x], guaranteed
+                # nonzero and negative since ix_x,iy_x was chosen to satisfy
+                # the saddle condition (or is the max-|Jz| fallback point;
+                # guard D0 either way before dividing).
+                if abs(D0) > 1e-12:
+                    dx_off = (-Bx0 * a22 + By0 * a12) / D0
+                    dy_off = (-By0 * a11 + a21 * Bx0) / D0
+                    # Clip to a fraction of one cell: a Newton step assumes
+                    # local linearity, which can break down if the chosen
+                    # point is a poor initial guess (e.g. the max-|Jz|
+                    # fallback branch); clipping keeps the correction a
+                    # genuine sub-grid refinement rather than a wild
+                    # extrapolation.
+                    dx_off = float(np.clip(dx_off, -0.75 * dx, 0.75 * dx))
+                    dy_off = float(np.clip(dy_off, -0.75 * dy, 0.75 * dy))
+                else:
+                    dx_off = dy_off = 0.0
+
+                Az0 = float(Az[ix_x, iy_x])
+                Ez0 = float(Ez_field[ix_x, iy_x])
+                Ez_dx0 = float(Ez_dx_field[ix_x, iy_x])
+                Ez_dy0 = float(Ez_dy_field[ix_x, iy_x])
+
+                az_refined = Az0 + Bx0 * dy_off - By0 * dx_off
+                ez_refined = Ez0 + Ez_dx0 * dx_off + Ez_dy0 * dy_off
+
+                az_xline_hist.append(az_refined)
+                ez_xline_hist.append(ez_refined)
 
             emag_hist.append(0.5 * float(jnp.mean(Bx ** 2 + By ** 2 + Bz ** 2)))
             ekin_hist.append(0.5 * float(jnp.mean(rho * (vx ** 2 + vy ** 2 + vz ** 2))))
@@ -636,16 +705,14 @@ def run(label, di, eta, nu, t_final, n_diag,
                   f"{fallback_count[sheet_id]}/{n_diag_taken} diagnostic "
                   f"snapshots -- inspect those timestamps if the flux curve "
                   f"still looks glitchy")
-        if n_diag_taken > 0 and multi_saddle_count[sheet_id] > 0:
-            print(f"[{label}] sheet {sheet_id}: more than one genuine saddle "
-                  f"point (candidate X-line) coexisted in the search window "
-                  f"on {multi_saddle_count[sheet_id]}/{n_diag_taken} "
-                  f"snapshots -- a direct census of plasmoid-chain activity. "
+        if n_diag_taken > 0:
+            print(f"[{label}] sheet {sheet_id}: {multi_saddle_count[sheet_id]}"
+                  f"/{n_diag_taken} snapshots had >1 grid cell satisfying "
+                  f"D<0 in-window (expected near any single X-line -- see "
+                  f"code comment; NOT a plasmoid-chain count on its own). "
                   f"The continuity penalty (CONTINUITY_FRAC={CONTINUITY_FRAC}) "
-                  f"is what keeps the tracker on one of them instead of "
-                  f"relabeling frame to frame; if analyze_phase0.py still "
-                  f"flags glitches at the same timestamps, increase "
-                  f"CONTINUITY_FRAC before concluding the physics is at fault.")
+                  f"still guards against relabeling onto a genuinely "
+                  f"different saddle when one does exist.")
 
     rho, vx, vy, vz, Bx, By, Bz = state
     return {
